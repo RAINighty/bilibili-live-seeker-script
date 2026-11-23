@@ -483,73 +483,158 @@
 
     // ----------------------- HLS 原画（play-gateway master） -----------------------
     // 2026-11 起 getRoomPlayInfo 不再响应 qn=25000，但 play-gateway 的 master m3u8 在 qn=25000 时
-    // 仍会给出「原画真彩」(BILI-QN=25000) 的未二压 HLS fMP4 流，且不需要登录
+    // 仍会给出「原画真彩」(BILI-QN=25000) 的未二压 HLS fMP4 流，且不需要登录。
+    // 请求一律异步（带超时），避免网络卡顿时冻结页面：fetch 路径会等待结果；
+    // XHR / 初始数据等同步路径只读缓存，未就绪时在后台获取，就绪后重载一次播放器
 
-    /** @type {{ [room_id: string]: { ts: number, codecs: any[] } }} */
+    const HLS_CACHE_TTL = 5 * 60 * 1000;
+    const HLS_FAIL_TTL = 30 * 1000; // 获取失败只短暂缓存，避免一次失败导致长时间拿不到原画
+    const HLS_REQUEST_TIMEOUT = 5000;
+
+    /** @typedef {{ info: string, url: URL }} HlsVariant */
+    /** @type {{ [room_id: string]: { ts: number, ttl: number, variants: HlsVariant[] } }} */
     const hlsOriginalCache = {};
+    /** @type {{ [room_id: string]: Promise<HlsVariant[]> }} */
+    const hlsOriginalPending = {};
 
-    /** @param {number|string} room_id * @param {any} uid * @returns {any[]} codec 列表（可能为空） */
-    const getHlsOriginalCodecs = (room_id, uid) => {
-        const cached = hlsOriginalCache[room_id];
-        if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.codecs;
-        /** @type {any[]} */
-        const codecs = [];
+    /** @param {string} text * @param {string} baseUrl * @returns {HlsVariant[]} */
+    const parseMasterM3u8 = (text, baseUrl) => {
+        const lines = text.split('\n').map(l => l.trim());
+        /** @type {HlsVariant[]} */
+        const variants = [];
+        lines.forEach((line, i) => {
+            const next = lines[i + 1];
+            if (line.startsWith('#EXT-X-STREAM-INF:') && next && !next.startsWith('#')) {
+                try {
+                    variants.push({ info: line, url: new URL(next, baseUrl) });
+                } catch (e) {
+                    console.warn('[bililive-seeker] skip invalid variant url', next);
+                }
+            }
+        });
+        return variants;
+    }
+
+    /** @param {number|string} room_id * @returns {Promise<HlsVariant[]>} */
+    const requestHlsVariants = (room_id) => new Promise(resolve => {
+        const url = `https://api.live.bilibili.com/xlive/play-gateway/master/url?cid=${room_id}&mid=0&pt=web&p2p_type=-1&net=0&free_type=0&build=0&feature=2&qn=25000&drm_type=0&codec=0,1`;
         try {
             const request = new XMLHttpRequest();
-            request.open('GET', `https://api.live.bilibili.com/xlive/play-gateway/master/url?cid=${room_id}&mid=0&pt=web&p2p_type=-1&net=0&free_type=0&build=0&feature=2&qn=25000&drm_type=0&codec=0,1`, false);
+            request.open('GET', url, true);
+            request.timeout = HLS_REQUEST_TIMEOUT;
+            request.onload = () => {
+                const text = request.status === 200 ? request.responseText : '';
+                if (!text.startsWith('#EXTM3U')) {
+                    console.warn('[bililive-seeker] master m3u8 unavailable', request.status, text.slice(0, 100));
+                    resolve([]);
+                } else {
+                    resolve(parseMasterM3u8(text, request.responseURL || url));
+                }
+            };
+            request.onerror = request.onabort = () => { console.warn('[bililive-seeker] failed to get master m3u8'); resolve([]); };
+            request.ontimeout = () => { console.warn('[bililive-seeker] master m3u8 request timeout'); resolve([]); };
             request.send(null);
-            const text = request.status === 200 ? request.responseText : '';
-            if (!text.startsWith('#EXTM3U')) {
-                console.warn('[bililive-seeker] master m3u8 unavailable', request.status, text.slice(0, 100));
-            } else {
-                const lines = text.split('\n').map(l => l.trim());
-                /** @type {{ info: string, url: URL }[]} */
-                const variants = [];
-                lines.forEach((line, i) => {
-                    const next = lines[i + 1];
-                    if (line.startsWith('#EXT-X-STREAM-INF:') && next && !next.startsWith('#')) {
-                        variants.push({ info: line, url: new URL(next) });
-                    }
-                });
-                // 一般原画标为 BILI-QN=25000「原画真彩」；但主播推 HEVC 等情况下，
-                // 未二压的原画可能直接标为 BILI-QN=10000「原画」，此时按无后缀的原画文件名识别
-                let selected = variants.filter(v => /BILI-QN=25000\b/.test(v.info));
-                if (!selected.length) selected = variants.filter(v => isOriginalUrl(uid, v.url.pathname));
-                /** @type {{ [name: string]: any }} */
-                const byCodec = {};
-                selected.forEach(({ info: line, url }) => {
-                    const videoCodec = (line.match(/CODECS="([^",]+)/) || [])[1] || '';
-                    const name = videoCodec.startsWith('hvc1') || videoCodec.startsWith('hev1') ? 'hevc' : videoCodec.startsWith('av01') ? 'av1' : 'avc';
-                    if (!byCodec[name]) {
-                        byCodec[name] = {
-                            codec_name: name,
-                            current_qn: 25000,
-                            accept_qn: [25000],
-                            base_url: url.pathname + '?',
-                            url_info: [],
-                            hdr_qn: null,
-                            dolby_type: 0,
-                            attr_name: '',
-                            hdr_type: 0,
-                            drm: false,
-                            drm_key_systems: null,
-                            video_codecs: { base: videoCodec, ext: [''] },
-                            audio_codecs: { base: 'mp4a.40.2', ext: [''] },
-                            video_color_info: { colorspace: 'bt709', metadata_types: ['none'] },
-                        };
-                        codecs.push(byCodec[name]);
-                    }
-                    if (byCodec[name].base_url === url.pathname + '?') {
-                        byCodec[name].url_info.push({ host: url.origin, extra: url.search.slice(1), stream_ttl: 0 });
-                    }
-                });
-            }
         } catch (e) {
             console.error('[bililive-seeker] failed to get master m3u8\n', e);
+            resolve([]);
         }
+    });
+
+    /** 后台获取（同一房间并发请求会合并） @param {number|string|null|undefined} room_id * @returns {Promise<HlsVariant[]>} */
+    const prefetchHlsOriginal = (room_id) => {
+        if (!room_id) return Promise.resolve([]);
+        const cached = hlsOriginalCache[room_id];
+        if (cached && Date.now() - cached.ts < cached.ttl) return Promise.resolve(cached.variants);
+        if (!hlsOriginalPending[room_id]) {
+            hlsOriginalPending[room_id] = requestHlsVariants(room_id).then(variants => {
+                hlsOriginalCache[room_id] = { ts: Date.now(), ttl: variants.length ? HLS_CACHE_TTL : HLS_FAIL_TTL, variants };
+                delete hlsOriginalPending[room_id];
+                return variants;
+            });
+        }
+        return hlsOriginalPending[room_id];
+    }
+
+    /** @param {HlsVariant[]} variants * @param {any} uid * @returns {any[]} codec 列表（可能为空） */
+    const buildHlsOriginalCodecs = (variants, uid) => {
+        // 一般原画标为 BILI-QN=25000「原画真彩」；但主播推 HEVC 等情况下，
+        // 未二压的原画可能直接标为 BILI-QN=10000「原画」，此时按无后缀的原画文件名识别
+        let selected = variants.filter(v => /BILI-QN=25000\b/.test(v.info));
+        if (!selected.length) selected = variants.filter(v => isOriginalUrl(uid, v.url.pathname));
+        /** @type {any[]} */
+        const codecs = [];
+        /** @type {{ [name: string]: any }} */
+        const byCodec = {};
+        selected.forEach(({ info: line, url }) => {
+            const videoCodec = (line.match(/CODECS="([^",]+)/) || [])[1] || '';
+            const name = videoCodec.startsWith('hvc1') || videoCodec.startsWith('hev1') ? 'hevc' : videoCodec.startsWith('av01') ? 'av1' : 'avc';
+            if (!byCodec[name]) {
+                byCodec[name] = {
+                    codec_name: name,
+                    current_qn: 25000,
+                    accept_qn: [25000],
+                    base_url: url.pathname + '?',
+                    url_info: [],
+                    hdr_qn: null,
+                    dolby_type: 0,
+                    attr_name: '',
+                    hdr_type: 0,
+                    drm: false,
+                    drm_key_systems: null,
+                    video_codecs: { base: videoCodec, ext: [''] },
+                    audio_codecs: { base: 'mp4a.40.2', ext: [''] },
+                    video_color_info: { colorspace: 'bt709', metadata_types: ['none'] },
+                };
+                codecs.push(byCodec[name]);
+            }
+            if (byCodec[name].base_url === url.pathname + '?') {
+                byCodec[name].url_info.push({ host: url.origin, extra: url.search.slice(1), stream_ttl: 0 });
+            }
+        });
         console.debug('[bililive-seeker] hls original codecs', codecs);
-        hlsOriginalCache[room_id] = { ts: Date.now(), codecs };
         return codecs;
+    }
+
+    /**
+     * 只读缓存，不发请求
+     * @param {any[]} roomIds 可能的房间号（长号/请求中的号） * @param {any} uid
+     * @returns {any[]|null} codec 列表；缓存未就绪时为 null
+     */
+    const peekHlsOriginalCodecs = (roomIds, uid) => {
+        for (const id of roomIds) {
+            const cached = hlsOriginalCache[id];
+            if (cached && Date.now() - cached.ts < cached.ttl) return buildHlsOriginalCodecs(cached.variants, uid);
+        }
+        return null;
+    }
+
+    /** @type {Set<string>} */
+    const hlsReloadedRooms = new Set();
+    /**
+     * 同步路径缓存未就绪时：后台获取完成后，若播放器仍在播放「原画真彩」的二压流，重载一次播放器
+     * @param {any} room_id * @param {any} uid
+     */
+    const reloadWhenHlsReady = (room_id, uid) => {
+        prefetchHlsOriginal(room_id).then(variants => {
+            if (!buildHlsOriginalCodecs(variants, uid).some(codec => isCodecPlayable(codec))) return;
+            const key = String(room_id);
+            if (hlsReloadedRooms.has(key)) return; // 已重载过或已有检查在排队
+            hlsReloadedRooms.add(key);
+            setTimeout(() => {
+                try {
+                    const player = W.livePlayer;
+                    const info = player?.getPlayerInfo?.();
+                    if (!info || Number(info.quality) !== 25000 || !info.playurl || isOriginalUrl(uid, info.playurl)) {
+                        hlsReloadedRooms.delete(key); // 不需要重载，允许之后再检查
+                        return;
+                    }
+                    console.debug('[bililive-seeker] hls original ready, reload player');
+                    player.reload();
+                } catch (e) {
+                    console.error('[bililive-seeker] failed to reload player for hls original\n', e);
+                }
+            }, 1000);
+        });
     }
 
     /** 浏览器是否能解码该 codec；没有编码信息时视为可播放 @param {any} codec * @returns {boolean} */
@@ -630,31 +715,47 @@
     /** @param {any} playurl */
     const ensureQn25000Desc = (playurl) => {
         if (!playurl.g_qn_desc) return;
+        // 接口自带完整描述时保持原样，避免覆盖其中的 HDR 等信息
+        if (playurl.g_qn_desc.some(desc => desc.qn === 25000 && desc.media_base_desc)) return;
+        // 关闭「HLS原画」时只能尝试加载缓存的原画 FLV，不能保证是未二压的原画，文案沿用旧版
+        const hls = isChecked('hls-original', true);
         playurl.g_qn_desc = playurl.g_qn_desc.filter(desc => desc.qn !== 25000);
         playurl.g_qn_desc.splice(0, 0, {
             "qn": 25000,
-            "desc": "原画真彩",
+            "desc": hls ? "原画真彩" : "隐藏原画",
             "hdr_desc": "",
             "attr_desc": null,
             "hdr_type": 0,
             "media_base_desc": {
-                "detail_desc": { "desc": "未二压的真原画" },
-                "brief_desc": { "desc": "原画", "badge": "真彩" }
+                "detail_desc": { "desc": hls ? "未二压的真原画" : "尝试获取原画" },
+                "brief_desc": hls ? { "desc": "原画", "badge": "真彩" } : { "desc": "原画" }
             },
             "eotf": 0
         });
     }
 
-    /** @param {string|undefined} url * @returns {number|null} */
-    const getRequestedQn = (url) => {
+    /** @param {string|undefined} url * @param {string} name * @returns {string|null} */
+    const getUrlParam = (url, name) => {
         try {
             if (!url) return null;
-            const qn = new URL(url, location.href).searchParams.get('qn');
-            return qn === null ? null : Number(qn);
+            return new URL(url, location.href).searchParams.get(name);
         } catch (e) {
             return null;
         }
     }
+
+    /** @param {string|undefined} url * @returns {number|null} */
+    const getRequestedQn = (url) => {
+        const qn = getUrlParam(url, 'qn');
+        return qn === null ? null : Number(qn);
+    }
+
+    /** 该请求是否需要 HLS 原画（未指定画质时按「自动原画」推断） @param {string|undefined} url */
+    const wantsHlsOriginal = (url) =>
+        (getRequestedQn(url) ?? (isChecked('auto-quality', true) ? 25000 : 0)) === 25000 && !!isChecked('hls-original', true);
+
+    /** 发出 getRoomPlayInfo 请求的同时预取 HLS 原画 @param {string} url * @returns {Promise<any>} */
+    const prefetchHlsForRequest = (url) => wantsHlsOriginal(url) ? prefetchHlsOriginal(getUrlParam(url, 'room_id')) : Promise.resolve([]);
 
     /** @param {any} uid * @param {any} playurl */
     const containsOriginal = (uid, playurl) => playurl.stream.some(
@@ -716,11 +817,16 @@
                 }
             }
             // 优先级：响应自带的原画 / 缓存的原画 FLV > HLS 原画 > 二压
-            const requestedQn = getRequestedQn(reqUrl) ?? (isChecked('auto-quality', true) ? 25000 : 0);
-            if (!hasOriginal && !usedCache && requestedQn === 25000 && isChecked('hls-original', true)) {
-                const allCodecs = getHlsOriginalCodecs(playurl.cid || r.data.room_id, r.data.uid);
-                const codecs = allCodecs.filter(codec => isCodecPlayable(codec));
-                if (allCodecs.length && !codecs.length) {
+            if (!hasOriginal && !usedCache && wantsHlsOriginal(reqUrl)) {
+                const roomIds = [playurl.cid, r.data.room_id, getUrlParam(reqUrl, 'room_id')].filter(Boolean);
+                const allCodecs = peekHlsOriginalCodecs(roomIds, r.data.uid);
+                if (allCodecs === null) {
+                    // 同步路径（XHR / 初始数据）且缓存未就绪：本次先用二压，后台获取完成后重载一次播放器
+                    console.debug('[bililive-seeker] hls original not ready, fetching in background');
+                    reloadWhenHlsReady(roomIds[0], r.data.uid);
+                }
+                const codecs = (allCodecs || []).filter(codec => isCodecPlayable(codec));
+                if (allCodecs?.length && !codecs.length) {
                     console.warn('[bililive-seeker] browser cannot decode hls original, skip', allCodecs.map(c => c.video_codecs.base));
                 }
                 if (codecs.length) {
@@ -783,8 +889,11 @@
                     arguments[0] = (resource instanceof Request) ? new Request(url, resource) : url;
                     // since this should only be GET request
                     console.debug('[bililive-seeker] modified roomPlayInfo fetch request', arguments);
+                    const hlsReady = prefetchHlsForRequest(url); // 与 playinfo 请求并行
                     const response = await origFetch.apply(this, arguments);
-                    const r = interceptPlayurl(await response.clone().json(), url);
+                    const rsp = await response.clone().json();
+                    await hlsReady;
+                    const r = interceptPlayurl(rsp, url);
                     console.debug('[bililive-seeker] modified roomPlayInfo fetch response', r);
                     return new Response(JSON.stringify(r), response);
                 } else if (url.match('api.live.bilibili.com/live/getRoundPlayVideo') && isChecked('block-roundplay', true)) {
@@ -823,6 +932,8 @@
                 if (url.match('api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo')) {
                     url = replaceRoomplayReqUrl(url);
                     arguments[1] = url;
+                    // responseText 的 hook 只能同步读缓存，这里提前开始获取，尽量在响应前就绪
+                    prefetchHlsForRequest(url);
                 }
             } catch (e) {
                 console.error('[bililive-seeker] error from hooked `xhr.open`\n', e);
@@ -1064,7 +1175,7 @@
             '#seeker-control-panel label { margin: 0; color: inherit; cursor: inherit; }' +
             '#seeker-control-panel .sk-chip { padding-inline-start: 5px; }' +
             '#seeker-control-panel .sk-chip input { appearance: none; box-sizing: border-box; display: inline-grid; place-content: center; flex: none; width: 11px; height: 11px; margin: 0; border: 1.5px solid color-mix(in srgb, currentColor 55%, transparent); border-radius: 50%; cursor: pointer; }' +
-            '#seeker-control-panel .sk-chip input::before { content: ""; width: 7px; height: 7px; background: currentColor; mask: url("data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'black\' stroke-width=\'4\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><polyline points=\'20 6 9 17 4 12\'/></svg>") no-repeat center / contain; scale: 0; transition: scale .15s ease; }' +
+            '#seeker-control-panel .sk-chip input::before { content: ""; width: 7px; height: 7px; background: currentColor; -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'black\' stroke-width=\'4\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><polyline points=\'20 6 9 17 4 12\'/></svg>") no-repeat center / contain; mask: url("data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'black\' stroke-width=\'4\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><polyline points=\'20 6 9 17 4 12\'/></svg>") no-repeat center / contain; scale: 0; transition: scale .15s ease; }' +
             '#seeker-control-panel .sk-chip input:focus-visible { outline: 2px solid var(--sk-accent); outline-offset: 2px; }' +
             '#seeker-control-panel .sk-chip:has(input:checked) { background: var(--sk-accent); border-color: var(--sk-accent); color: #fff !important; }' +
             '#seeker-control-panel .sk-chip:has(input:checked) label { color: #fff !important; }' +
@@ -1081,6 +1192,8 @@
             '#seeker-control-panel .sk-chip label:is(.danmaku-lost, .live-on, .video-error, .reload) { color: #fff !important; }' +
             '#seeker-control-panel .sk-chip.sk-chip:has(label:is(.danmaku-lost, .live-on, .video-error, .reload)):not(:has(input:checked)) label { color: var(--sk-warn) !important; }' +
             '@media (max-width: 1440px) { #seeker-control-panel .sk-row { gap: 3px; } #seeker-control-panel :is(.sk-chip, .sk-btn, .sk-field) { padding: 0 6px; } #seeker-control-panel .sk-chip { padding-inline-start: 4px; } #seeker-control-panel .sk-field { padding-inline-end: 3px; } }' +
+            // 不支持 color-mix() 的浏览器（Chrome < 111、Firefox < 113、Safari < 16.2）退回固定的半透明灰色
+            '@supports not (color: color-mix(in srgb, red 50%, transparent)) { #seeker-control-panel { --sk-line: rgba(128, 128, 128, .45); --sk-line-hover: rgba(128, 128, 128, .8); --sk-fill: rgba(128, 128, 128, .12); } #seeker-control-panel .sk-warn { border-color: var(--sk-warn); } #seeker-control-panel .sk-chip input { border: 1.5px solid rgba(128, 128, 128, .8); } }' +
             '@media (prefers-reduced-motion: reduce) { #seeker-control-panel * { transition: none !important; } }' +
             '</style>'
         );
@@ -1099,11 +1212,8 @@
             if (!controlPanel.contains(t) && !btn?.contains(t)) controlPanel.classList.remove('sk-open');
         });
         // 页面组件重新渲染时可能移除面板，检测到后重新挂载
-        setInterval(() => {
-            if (controlPanel.isConnected) return;
-            const mount = document.querySelector(PANEL_MOUNT_QUERY);
-            if (mount) mountControlPanel(mount, controlPanel);
-        }, 2000);
+        keepMounted(controlPanel, PANEL_MOUNT_QUERY, mountControlPanel);
+        observePanelLayout();
 
         queryAllElements('label, button, a', controlPanel).forEach(node => {
             node.classList.add('live-skin-normal-a-text');
@@ -1394,8 +1504,58 @@
         if (!panelFloating && need > avail) setPanelFloating(panel, true);
         else if (panelFloating && need <= avail - 8) setPanelFloating(panel, false);
     };
-    setInterval(updatePanelLayout, 1000);
-    window.addEventListener('resize', () => updatePanelLayout());
+
+    // 用 ResizeObserver 代替定时轮询：头部容器及其子元素（包括面板自身、人气榜等模块）尺寸变化时才重新计算
+    let layoutFrame = 0;
+    const scheduleLayoutUpdate = () => {
+        if (layoutFrame) return;
+        // 推迟到下一帧，避免在 ResizeObserver 回调里改布局导致 "ResizeObserver loop" 警告
+        layoutFrame = requestAnimationFrame(() => { layoutFrame = 0; updatePanelLayout(); });
+    };
+    const layoutResizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleLayoutUpdate) : null;
+    /** @type {HTMLElement|null} */
+    let observedLayoutHost = null;
+    let observedChildCount = -1;
+    /** 观察面板当前所在容器及其子元素；面板被重新挂载或容器子元素变化后需要重新调用 */
+    const observePanelLayout = () => {
+        const host = document.querySelector('#seeker-control-panel')?.parentElement || null;
+        if (!layoutResizeObserver) return scheduleLayoutUpdate();
+        layoutResizeObserver.disconnect();
+        observedLayoutHost = host;
+        observedChildCount = host ? host.childElementCount : -1;
+        if (host) {
+            layoutResizeObserver.observe(host);
+            queryAllElements(':scope > *', host).forEach(e => layoutResizeObserver.observe(e));
+        }
+        scheduleLayoutUpdate();
+    };
+    if (!layoutResizeObserver) setInterval(updatePanelLayout, 1000);
+    window.addEventListener('resize', scheduleLayoutUpdate);
+
+    /** @type {{ el: HTMLElement, query: string, mount: (mount: HTMLElement, el: HTMLElement) => void }[]} */
+    const mountedElements = [];
+    let remountFrame = 0;
+    const checkRemount = () => {
+        remountFrame = 0;
+        let changed = false;
+        mountedElements.forEach(({ el, query, mount }) => {
+            if (el.isConnected) return;
+            const target = /** @type {HTMLElement|null} */ (document.querySelector(query));
+            if (target) { mount(target, el); changed = true; }
+        });
+        const host = document.querySelector('#seeker-control-panel')?.parentElement || null;
+        // 容器换了，或容器里新增/移除了模块（如人气榜晚加载），需要重新观察
+        if (changed || host !== observedLayoutHost || (host && host.childElementCount !== observedChildCount)) observePanelLayout();
+    };
+    // 页面重新渲染时元素可能被移除：监听 DOM 变化（按帧合并）后重新挂载，代替定时轮询
+    const remountObserver = new MutationObserver(() => {
+        if (!remountFrame) remountFrame = requestAnimationFrame(checkRemount);
+    });
+    /** @param {HTMLElement} el * @param {string} query * @param {(mount: HTMLElement, el: HTMLElement) => void} mount */
+    const keepMounted = (el, query, mount) => {
+        if (!mountedElements.length) remountObserver.observe(document.documentElement, { childList: true, subtree: true });
+        mountedElements.push({ el, query, mount });
+    };
 
     const updatePanelHideState = () => {
         if (panelFloating) {
@@ -1441,11 +1601,7 @@
         }
         if (panelFloating && supportsPopover) e.popoverTargetElement = document.querySelector('#seeker-control-panel');
         mountShowHideButton(node, wrapper);
-        setInterval(() => {
-            if (wrapper.isConnected) return;
-            const mount = document.querySelector(SHOWHIDE_MOUNT_QUERY);
-            if (mount) mountShowHideButton(mount, wrapper);
-        }, 2000);
+        keepMounted(wrapper, SHOWHIDE_MOUNT_QUERY, mountShowHideButton);
         updatePanelHideState();
     }, 180 * 1000);
 
